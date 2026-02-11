@@ -1,0 +1,964 @@
+#!/bin/bash
+#
+# safe-rm: A safe wrapper for rm that prevents accidental deletions
+# Features:
+#   - Requires typing full path to confirm
+#   - Requires solving a math problem with large numbers
+#   - Moves to trash instead of immediate deletion
+#   - Auto-cleans trash after configurable days
+#   - Only allows deletion under ~/Documents, ~/Downloads, or ~
+#   - Blocks root directory deletion
+#   - Shadows /bin/rm via PATH priority
+#
+# Install:   curl -fsSL https://gist.githubusercontent.com/ivikasavnish/6336e16d11659980e70bd0403131bb54/raw/safe-rm | bash -s install
+# Uninstall: safe-rm --uninstall
+#
+
+set -euo pipefail
+
+# Configuration
+TRASH_DIR="${HOME}/.safe-rm-trash"
+TRASH_DAYS=7
+LOG_FILE="${TRASH_DIR}/.deletion-log"
+INSTALL_DIR="${HOME}/bin"
+INSTALL_PATH="${INSTALL_DIR}/safe-rm"
+RM_SHADOW_PATH="${INSTALL_DIR}/rm"
+REAL_RM="/bin/rm"
+BACKUP_RM="${INSTALL_DIR}/.rm-original-path"
+MCP_SERVER_PATH="${INSTALL_DIR}/safe-rm-mcp-server.py"
+GIST_BASE_URL="https://gist.githubusercontent.com/ivikasavnish/6336e16d11659980e70bd0403131bb54/raw"
+
+# Allowed parent directories (only paths under these can be deleted)
+ALLOWED_DIRS=(
+    "$HOME/Documents"
+    "$HOME/Downloads"
+    "$HOME"
+)
+
+# Colors
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# Find the real rm binary
+find_real_rm() {
+    # Check common locations
+    for rm_path in /bin/rm /usr/bin/rm; do
+        if [[ -x "$rm_path" ]]; then
+            echo "$rm_path"
+            return 0
+        fi
+    done
+    # Fallback: search PATH excluding our install dir
+    local path_without_us
+    path_without_us=$(echo "$PATH" | tr ':' '\n' | grep -v "^${INSTALL_DIR}$" | tr '\n' ':')
+    PATH="$path_without_us" command -v rm 2>/dev/null || echo "/bin/rm"
+}
+
+# Get shell config file
+get_shell_rc() {
+    if [[ "$SHELL" == *"zsh"* ]]; then
+        echo "$HOME/.zshrc"
+    elif [[ -f "$HOME/.bash_profile" ]]; then
+        echo "$HOME/.bash_profile"
+    else
+        echo "$HOME/.bashrc"
+    fi
+}
+
+# Installation
+do_install() {
+    echo -e "${CYAN}Installing safe-rm...${NC}"
+    echo ""
+
+    # Create install directory
+    mkdir -p "$INSTALL_DIR"
+
+    # Find and record the real rm location
+    local real_rm
+    real_rm=$(find_real_rm)
+    echo "$real_rm" > "$BACKUP_RM"
+    echo -e "Real rm found at: ${YELLOW}${real_rm}${NC}"
+
+    # Copy script to install path
+    if [[ -f "$0" ]] && [[ "$0" != "$INSTALL_PATH" ]]; then
+        cp "$0" "$INSTALL_PATH" 2>/dev/null || cat > "$INSTALL_PATH"
+    fi
+    chmod +x "$INSTALL_PATH"
+
+    # Create shadow symlink: ~/bin/rm -> ~/bin/safe-rm
+    ln -sf "$INSTALL_PATH" "$RM_SHADOW_PATH"
+    echo -e "Created shadow: ${YELLOW}${RM_SHADOW_PATH}${NC} -> ${INSTALL_PATH}"
+
+    # Get shell config
+    local shell_rc
+    shell_rc=$(get_shell_rc)
+
+    # Ensure ~/bin is in PATH (at the beginning to shadow /bin/rm)
+    if ! grep -q 'export PATH="\$HOME/bin:\$PATH"' "$shell_rc" 2>/dev/null; then
+        echo "" >> "$shell_rc"
+        echo "# safe-rm: Ensure ~/bin shadows system binaries" >> "$shell_rc"
+        echo 'export PATH="$HOME/bin:$PATH"' >> "$shell_rc"
+    fi
+
+    # Add alias as backup
+    if ! grep -q "alias rm='$INSTALL_PATH'" "$shell_rc" 2>/dev/null; then
+        echo "# safe-rm: Alias for rm" >> "$shell_rc"
+        echo "alias rm='$INSTALL_PATH'" >> "$shell_rc"
+    fi
+
+    # Add real-rm alias for bypass
+    if ! grep -q "alias real-rm=" "$shell_rc" 2>/dev/null; then
+        echo "# safe-rm: Bypass alias to use real rm" >> "$shell_rc"
+        echo "alias real-rm='$real_rm'" >> "$shell_rc"
+    fi
+
+    # Create trash directory
+    mkdir -p "$TRASH_DIR"
+
+    echo ""
+    echo -e "${GREEN}╔══════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║                    INSTALLATION COMPLETE                         ║${NC}"
+    echo -e "${GREEN}╚══════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "Shadow rm:    ${CYAN}${RM_SHADOW_PATH}${NC} (shadows /bin/rm via PATH)"
+    echo -e "Real rm:      ${CYAN}${real_rm}${NC}"
+    echo -e "Trash:        ${CYAN}${TRASH_DIR}${NC}"
+    echo -e "Config:       ${CYAN}${shell_rc}${NC}"
+    echo ""
+    echo -e "${YELLOW}Activate now:${NC} source $shell_rc"
+    echo ""
+    echo -e "${CYAN}Commands:${NC}"
+    echo "  rm -rf <path>       Safe deletion with confirmations"
+    echo "  rm --list-trash     View trash"
+    echo "  rm --restore <id>   Restore from trash"
+    echo "  rm --status         Check installation status"
+    echo "  rm --uninstall      Restore default rm"
+    echo ""
+    echo -e "${CYAN}Bypass options:${NC}"
+    echo "  real-rm             Alias to real rm (after sourcing)"
+    echo "  $real_rm            Direct path to real rm"
+    echo ""
+    exit 0
+}
+
+# Uninstallation
+do_uninstall() {
+    echo -e "${YELLOW}Uninstalling safe-rm...${NC}"
+    echo ""
+
+    local shell_rc
+    shell_rc=$(get_shell_rc)
+
+    # Remove shadow symlink
+    if [[ -L "$RM_SHADOW_PATH" ]]; then
+        /bin/rm -f "$RM_SHADOW_PATH"
+        echo -e "Removed shadow: ${RM_SHADOW_PATH}"
+    fi
+
+    # Remove lines from shell config
+    if [[ -f "$shell_rc" ]]; then
+        # Create backup
+        cp "$shell_rc" "${shell_rc}.safe-rm-backup"
+
+        # Remove safe-rm related lines
+        grep -v "safe-rm" "$shell_rc" | grep -v "alias rm='$INSTALL_PATH'" | grep -v "alias real-rm=" > "${shell_rc}.tmp" || true
+        mv "${shell_rc}.tmp" "$shell_rc"
+        echo -e "Cleaned: ${shell_rc}"
+        echo -e "Backup:  ${shell_rc}.safe-rm-backup"
+    fi
+
+    echo ""
+    echo -e "${GREEN}╔══════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║                    UNINSTALL COMPLETE                            ║${NC}"
+    echo -e "${GREEN}╚══════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "Default rm restored: ${CYAN}$(find_real_rm)${NC}"
+    echo ""
+    echo -e "${YELLOW}Activate now:${NC} source $shell_rc"
+    echo -e "Or restart your terminal."
+    echo ""
+    echo -e "${CYAN}Note:${NC} safe-rm script kept at ${INSTALL_PATH}"
+    echo "      Trash kept at ${TRASH_DIR}"
+    echo "      Delete manually if desired."
+    echo ""
+    echo -e "To reinstall: ${CYAN}safe-rm install${NC}"
+    exit 0
+}
+
+# Show status
+do_status() {
+    echo -e "${CYAN}=== safe-rm Status ===${NC}"
+    echo ""
+
+    local real_rm
+    real_rm=$(find_real_rm)
+
+    # Check if shadow exists
+    if [[ -L "$RM_SHADOW_PATH" ]]; then
+        echo -e "Shadow rm:     ${GREEN}ACTIVE${NC} (${RM_SHADOW_PATH} -> $(readlink "$RM_SHADOW_PATH"))"
+    else
+        echo -e "Shadow rm:     ${RED}NOT INSTALLED${NC}"
+    fi
+
+    # Check PATH priority
+    local first_rm
+    first_rm=$(command -v rm 2>/dev/null || echo "not found")
+    if [[ "$first_rm" == "$RM_SHADOW_PATH" ]] || [[ "$first_rm" == "$INSTALL_PATH" ]]; then
+        echo -e "PATH priority: ${GREEN}OK${NC} (rm resolves to safe-rm)"
+    else
+        echo -e "PATH priority: ${YELLOW}WARNING${NC} (rm resolves to $first_rm)"
+    fi
+
+    # Real rm location
+    echo -e "Real rm:       ${CYAN}${real_rm}${NC}"
+
+    # Trash info
+    if [[ -d "$TRASH_DIR" ]]; then
+        local trash_count trash_size
+        trash_count=$(find "$TRASH_DIR" -mindepth 1 -maxdepth 1 ! -name ".deletion-log" 2>/dev/null | wc -l | tr -d ' ')
+        trash_size=$(du -sh "$TRASH_DIR" 2>/dev/null | cut -f1) || trash_size="unknown"
+        echo -e "Trash:         ${CYAN}${trash_count} items (${trash_size})${NC}"
+    else
+        echo -e "Trash:         ${YELLOW}Not created${NC}"
+    fi
+
+    # Shell config
+    local shell_rc
+    shell_rc=$(get_shell_rc)
+    if grep -q "safe-rm" "$shell_rc" 2>/dev/null; then
+        echo -e "Shell config:  ${GREEN}Configured${NC} ($shell_rc)"
+    else
+        echo -e "Shell config:  ${YELLOW}Not configured${NC}"
+    fi
+
+    echo ""
+    echo -e "${CYAN}Bypass commands:${NC}"
+    echo "  real-rm <args>      Use real rm via alias"
+    echo "  $real_rm <args>     Use real rm directly"
+    echo ""
+    exit 0
+}
+
+# Download MCP server
+download_mcp_server() {
+    echo -e "${CYAN}Downloading MCP server...${NC}"
+    curl -fsSL "${GIST_BASE_URL}/safe-rm-mcp-server.py" -o "$MCP_SERVER_PATH"
+    chmod +x "$MCP_SERVER_PATH"
+    echo -e "${GREEN}MCP server installed: ${MCP_SERVER_PATH}${NC}"
+}
+
+# Generate MCP config JSON for a specific editor
+generate_mcp_config() {
+    cat << EOF
+{
+  "mcpServers": {
+    "safe-rm": {
+      "command": "python3",
+      "args": ["${MCP_SERVER_PATH}"],
+      "env": {
+        "SAFE_RM_PATH": "${INSTALL_PATH}"
+      }
+    }
+  }
+}
+EOF
+}
+
+# Inject into Claude Code (CLAUDE.md)
+inject_claude_md() {
+    local target_dir="${1:-.}"
+    local claude_md="${target_dir}/CLAUDE.md"
+
+    local inject_content="
+## File Deletion Policy (safe-rm)
+
+This system uses safe-rm for file deletion safety.
+
+### Commands Safe for AI to Execute
+- \`rm --list-trash\` - View deleted items
+- \`rm --restore <id>\` - Restore from trash
+- \`rm --status\` - Check installation
+- \`rm --clean-old\` - Clean old trash items
+
+### Commands Requiring User Interaction
+- \`rm -rf <path>\` - Requires: path typing + math puzzle + DELETE
+- \`rm --destroy <id>\` - Requires: DESTROY confirmation
+- \`rm --empty-trash\` - Requires: DESTROY ALL confirmation
+
+### NEVER Use These (Blocked)
+- \`/bin/rm\` - Bypasses safety
+- \`real-rm\` - Bypasses safety
+- Piping input to rm commands
+
+### When User Asks to Delete
+Inform them to run \`rm -rf <path>\` manually and complete confirmation steps.
+"
+
+    if [[ -f "$claude_md" ]]; then
+        if grep -q "safe-rm" "$claude_md" 2>/dev/null; then
+            echo -e "${YELLOW}CLAUDE.md already contains safe-rm config${NC}"
+            return 0
+        fi
+        echo "$inject_content" >> "$claude_md"
+    else
+        echo "$inject_content" > "$claude_md"
+    fi
+    echo -e "${GREEN}Injected into: ${claude_md}${NC}"
+}
+
+# Inject into VS Code
+inject_vscode() {
+    local vscode_dir="${HOME}/.vscode"
+    local settings_dir="${HOME}/Library/Application Support/Code/User"
+    local mcp_config="${settings_dir}/globalStorage/anthropic.claude-code/settings/mcp.json"
+
+    # macOS path
+    if [[ ! -d "$settings_dir" ]]; then
+        # Linux path
+        settings_dir="${HOME}/.config/Code/User"
+        mcp_config="${settings_dir}/globalStorage/anthropic.claude-code/settings/mcp.json"
+    fi
+
+    mkdir -p "$(dirname "$mcp_config")"
+
+    if [[ -f "$mcp_config" ]]; then
+        # Backup existing
+        cp "$mcp_config" "${mcp_config}.backup"
+        # Merge config (simple append for now)
+        local existing
+        existing=$(cat "$mcp_config")
+        if echo "$existing" | grep -q "safe-rm"; then
+            echo -e "${YELLOW}VS Code MCP already has safe-rm${NC}"
+            return 0
+        fi
+    fi
+
+    generate_mcp_config > "$mcp_config"
+    echo -e "${GREEN}Injected into VS Code: ${mcp_config}${NC}"
+}
+
+# Inject into Cursor
+inject_cursor() {
+    local cursor_dir="${HOME}/.cursor"
+    local mcp_config="${cursor_dir}/mcp.json"
+
+    # Also check Application Support on macOS
+    local cursor_app_dir="${HOME}/Library/Application Support/Cursor/User"
+    if [[ -d "$cursor_app_dir" ]]; then
+        mcp_config="${cursor_app_dir}/globalStorage/anthropic.claude-code/settings/mcp.json"
+    fi
+
+    mkdir -p "$(dirname "$mcp_config")"
+
+    if [[ -f "$mcp_config" ]] && grep -q "safe-rm" "$mcp_config" 2>/dev/null; then
+        echo -e "${YELLOW}Cursor MCP already has safe-rm${NC}"
+        return 0
+    fi
+
+    generate_mcp_config > "$mcp_config"
+    echo -e "${GREEN}Injected into Cursor: ${mcp_config}${NC}"
+}
+
+# Inject into Windsurf
+inject_windsurf() {
+    local windsurf_config="${HOME}/.windsurf/mcp.json"
+    local windsurf_app="${HOME}/Library/Application Support/Windsurf/mcp_config.json"
+
+    local target="$windsurf_config"
+    [[ -d "$(dirname "$windsurf_app")" ]] && target="$windsurf_app"
+
+    mkdir -p "$(dirname "$target")"
+
+    if [[ -f "$target" ]] && grep -q "safe-rm" "$target" 2>/dev/null; then
+        echo -e "${YELLOW}Windsurf MCP already has safe-rm${NC}"
+        return 0
+    fi
+
+    generate_mcp_config > "$target"
+    echo -e "${GREEN}Injected into Windsurf: ${target}${NC}"
+}
+
+# Inject into Zed
+inject_zed() {
+    local zed_config="${HOME}/.config/zed/settings.json"
+    local zed_mcp="${HOME}/.config/zed/mcp.json"
+
+    mkdir -p "$(dirname "$zed_mcp")"
+
+    if [[ -f "$zed_mcp" ]] && grep -q "safe-rm" "$zed_mcp" 2>/dev/null; then
+        echo -e "${YELLOW}Zed MCP already has safe-rm${NC}"
+        return 0
+    fi
+
+    generate_mcp_config > "$zed_mcp"
+    echo -e "${GREEN}Injected into Zed: ${zed_mcp}${NC}"
+}
+
+# Inject into Claude Desktop
+inject_claude_desktop() {
+    local claude_config="${HOME}/Library/Application Support/Claude/claude_desktop_config.json"
+
+    # Linux path
+    [[ ! -d "$(dirname "$claude_config")" ]] && claude_config="${HOME}/.config/claude/claude_desktop_config.json"
+
+    mkdir -p "$(dirname "$claude_config")"
+
+    if [[ -f "$claude_config" ]]; then
+        if grep -q "safe-rm" "$claude_config" 2>/dev/null; then
+            echo -e "${YELLOW}Claude Desktop already has safe-rm${NC}"
+            return 0
+        fi
+        cp "$claude_config" "${claude_config}.backup"
+    fi
+
+    generate_mcp_config > "$claude_config"
+    echo -e "${GREEN}Injected into Claude Desktop: ${claude_config}${NC}"
+}
+
+# Inject into global MCP config
+inject_global_mcp() {
+    local global_mcp="${HOME}/.mcp/config.json"
+
+    mkdir -p "$(dirname "$global_mcp")"
+
+    if [[ -f "$global_mcp" ]] && grep -q "safe-rm" "$global_mcp" 2>/dev/null; then
+        echo -e "${YELLOW}Global MCP already has safe-rm${NC}"
+        return 0
+    fi
+
+    generate_mcp_config > "$global_mcp"
+    echo -e "${GREEN}Injected into global MCP: ${global_mcp}${NC}"
+}
+
+# Show inject menu
+do_inject_menu() {
+    echo ""
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║              safe-rm MCP & AI Agent Injection Menu               ║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "${YELLOW}Select targets to inject safe-rm configuration:${NC}"
+    echo ""
+    echo "  1) Claude Desktop (MCP server)"
+    echo "  2) VS Code / Claude Code extension (MCP server)"
+    echo "  3) Cursor (MCP server)"
+    echo "  4) Windsurf (MCP server)"
+    echo "  5) Zed (MCP server)"
+    echo "  6) Global MCP config (~/.mcp/config.json)"
+    echo "  7) CLAUDE.md in current directory"
+    echo "  8) CLAUDE.md in home directory"
+    echo ""
+    echo "  a) ALL of the above"
+    echo "  q) Quit"
+    echo ""
+    echo -e "${CYAN}Enter choices (e.g., 1 3 5 or 'a' for all):${NC}"
+    read -r choices
+
+    # First, ensure MCP server is downloaded
+    if [[ ! -f "$MCP_SERVER_PATH" ]]; then
+        download_mcp_server
+    fi
+
+    echo ""
+
+    if [[ "$choices" == "q" ]]; then
+        echo "Cancelled."
+        exit 0
+    fi
+
+    if [[ "$choices" == "a" ]]; then
+        choices="1 2 3 4 5 6 7 8"
+    fi
+
+    for choice in $choices; do
+        case $choice in
+            1) inject_claude_desktop ;;
+            2) inject_vscode ;;
+            3) inject_cursor ;;
+            4) inject_windsurf ;;
+            5) inject_zed ;;
+            6) inject_global_mcp ;;
+            7) inject_claude_md "." ;;
+            8) inject_claude_md "$HOME" ;;
+            *) echo -e "${RED}Unknown option: $choice${NC}" ;;
+        esac
+    done
+
+    echo ""
+    echo -e "${GREEN}Injection complete!${NC}"
+    echo ""
+    echo -e "${CYAN}MCP Server:${NC} ${MCP_SERVER_PATH}"
+    echo -e "${CYAN}To test:${NC} python3 ${MCP_SERVER_PATH}"
+    echo ""
+    echo "Restart your editors to load the MCP server."
+}
+
+# Auto-inject all (non-interactive)
+do_inject_all() {
+    echo -e "${CYAN}Auto-injecting safe-rm into all detected editors...${NC}"
+    echo ""
+
+    # Download MCP server
+    if [[ ! -f "$MCP_SERVER_PATH" ]]; then
+        download_mcp_server
+    fi
+
+    # Inject into all targets
+    inject_claude_desktop
+    inject_vscode
+    inject_cursor
+    inject_windsurf
+    inject_zed
+    inject_global_mcp
+    inject_claude_md "$HOME"
+
+    echo ""
+    echo -e "${GREEN}Auto-injection complete!${NC}"
+}
+
+# Handle install/uninstall/status/inject before anything else
+case "${1:-}" in
+    install)
+        do_install
+        ;;
+    --uninstall|uninstall)
+        do_uninstall
+        ;;
+    --status|status)
+        do_status
+        ;;
+    --inject|inject)
+        do_inject_menu
+        exit 0
+        ;;
+    --inject-all|inject-all)
+        do_inject_all
+        exit 0
+        ;;
+    --mcp-server)
+        # Run MCP server directly
+        if [[ ! -f "$MCP_SERVER_PATH" ]]; then
+            download_mcp_server
+        fi
+        exec python3 "$MCP_SERVER_PATH"
+        ;;
+esac
+
+# Create trash directory
+mkdir -p "$TRASH_DIR"
+
+# Show usage
+usage() {
+    cat << 'EOF'
+Usage: safe-rm [OPTIONS] <path>
+
+A safe rm wrapper requiring confirmation and using trash.
+
+Deletion Options:
+  -r, -R, --recursive    Remove directories recursively
+  -f, --force            Ignore nonexistent files (still requires confirmation)
+
+Trash Management:
+  --list-trash           List items in trash
+  --restore <item>       Restore item from trash
+  --destroy <item>       PERMANENTLY delete item from trash (escape route)
+  --empty-trash          Empty entire trash permanently
+  --clean-old            Remove items older than 7 days
+
+Installation:
+  install                Install safe-rm and shadow /bin/rm
+  --uninstall            Restore default rm behavior
+  --status               Show installation status
+
+AI/MCP Integration:
+  --inject               Interactive menu to inject MCP server into editors
+  --inject-all           Auto-inject into all detected editors
+  --mcp-server           Run MCP server directly
+
+General:
+  -h, --help             Show this help
+
+Restrictions:
+  - Only paths under ~/Documents, ~/Downloads, or ~/ can be deleted
+  - Root directory (/) cannot be deleted
+  - System directories are protected
+
+Trash: ~/.safe-rm-trash (kept 7 days)
+Bypass: real-rm or /bin/rm
+
+MCP Server: Provides safe-rm tools to AI agents via Model Context Protocol
+EOF
+    exit 0
+}
+
+# Generate random large numbers (7 digits)
+generate_large_number() {
+    echo $((RANDOM * RANDOM % 9000000 + 1000000))
+}
+
+# Check if path is allowed for deletion
+is_path_allowed() {
+    local check_path="$1"
+
+    # Block root
+    if [[ "$check_path" == "/" ]]; then
+        echo -e "${RED}ERROR: Cannot delete root directory!${NC}"
+        return 1
+    fi
+
+    # Block common system directories
+    local blocked_paths=("/" "/bin" "/sbin" "/usr" "/etc" "/var" "/tmp" "/opt" "/System" "/Library" "/Applications" "/private" "/cores" "/dev")
+    for blocked in "${blocked_paths[@]}"; do
+        if [[ "$check_path" == "$blocked" || "$check_path" == "$blocked/" ]]; then
+            echo -e "${RED}ERROR: Cannot delete system directory: $blocked${NC}"
+            return 1
+        fi
+        # Also block subdirectories of system paths
+        if [[ "$check_path" == "$blocked"/* ]]; then
+            echo -e "${RED}ERROR: Cannot delete under system directory: $blocked${NC}"
+            return 1
+        fi
+    done
+
+    # Must be under allowed directories
+    local is_allowed=false
+    for allowed in "${ALLOWED_DIRS[@]}"; do
+        if [[ "$check_path" == "$allowed"/* || "$check_path" == "$allowed" ]]; then
+            # But don't allow deleting home directory itself
+            if [[ "$check_path" == "$HOME" || "$check_path" == "$HOME/" ]]; then
+                echo -e "${RED}ERROR: Cannot delete home directory itself!${NC}"
+                return 1
+            fi
+            is_allowed=true
+            break
+        fi
+    done
+
+    if [[ "$is_allowed" == false ]]; then
+        echo -e "${RED}ERROR: Path not allowed. Only these directories permitted:${NC}"
+        for allowed in "${ALLOWED_DIRS[@]}"; do
+            echo "  - $allowed"
+        done
+        return 1
+    fi
+
+    return 0
+}
+
+# List trash contents
+list_trash() {
+    echo -e "${CYAN}=== Trash Contents ===${NC}"
+    echo ""
+    if [[ -f "$LOG_FILE" ]] && [[ -s "$LOG_FILE" ]]; then
+        printf "%-20s %-45s %s\n" "DATE" "ORIGINAL PATH" "TRASH ID"
+        echo "--------------------------------------------------------------------------------"
+        while IFS='|' read -r date original_path trash_name; do
+            if [[ -e "${TRASH_DIR}/${trash_name}" ]]; then
+                local short_path="$original_path"
+                if [[ ${#original_path} -gt 43 ]]; then
+                    short_path="...${original_path: -40}"
+                fi
+                printf "%-20s %-45s %s\n" "$date" "$short_path" "$trash_name"
+            fi
+        done < "$LOG_FILE"
+    else
+        echo "Trash is empty."
+    fi
+    echo ""
+    echo -e "Restore:  ${CYAN}safe-rm --restore <TRASH_ID>${NC}"
+    echo -e "Destroy:  ${CYAN}safe-rm --destroy <TRASH_ID>${NC}"
+}
+
+# Clean old items from trash
+clean_old_trash() {
+    echo -e "${YELLOW}Cleaning items older than ${TRASH_DAYS} days...${NC}"
+    local count=0
+    local real_rm
+    real_rm=$(find_real_rm)
+
+    while IFS= read -r -d '' item; do
+        "$real_rm" -rf "$item"
+        ((count++))
+    done < <(find "$TRASH_DIR" -mindepth 1 -maxdepth 1 -mtime +${TRASH_DAYS} ! -name ".deletion-log" -print0 2>/dev/null || true)
+
+    echo -e "${GREEN}Removed ${count} old items.${NC}"
+}
+
+# Destroy single item from trash permanently
+destroy_from_trash() {
+    local trash_name="$1"
+    local trash_path="${TRASH_DIR}/${trash_name}"
+
+    if [[ ! -e "$trash_path" ]]; then
+        echo -e "${RED}Error: '${trash_name}' not found in trash.${NC}"
+        echo "Use --list-trash to see available items."
+        exit 1
+    fi
+
+    local size
+    size=$(du -sh "$trash_path" 2>/dev/null | cut -f1) || size="unknown"
+
+    echo ""
+    echo -e "${RED}PERMANENT DELETION FROM TRASH${NC}"
+    echo -e "Item: $trash_name"
+    echo -e "Size: $size"
+    echo ""
+    echo -e "${YELLOW}Type 'DESTROY' to permanently delete:${NC}"
+    read -r confirm
+
+    if [[ "$confirm" == "DESTROY" ]]; then
+        local real_rm
+        real_rm=$(find_real_rm)
+        "$real_rm" -rf "$trash_path"
+        # Remove from log
+        if [[ -f "$LOG_FILE" ]]; then
+            grep -v "|${trash_name}$" "$LOG_FILE" > "${LOG_FILE}.tmp" 2>/dev/null || true
+            mv "${LOG_FILE}.tmp" "$LOG_FILE" 2>/dev/null || true
+        fi
+        echo -e "${GREEN}Permanently deleted.${NC}"
+    else
+        echo -e "${RED}Aborted.${NC}"
+        exit 1
+    fi
+}
+
+# Empty trash completely
+empty_trash() {
+    echo -e "${RED}WARNING: PERMANENT deletion of ALL trash items!${NC}"
+    echo ""
+    list_trash
+
+    echo -e "${YELLOW}Type 'DESTROY ALL' to confirm:${NC}"
+    read -r confirm
+
+    if [[ "$confirm" == "DESTROY ALL" ]]; then
+        local real_rm
+        real_rm=$(find_real_rm)
+        find "$TRASH_DIR" -mindepth 1 -maxdepth 1 ! -name ".deletion-log" -exec "$real_rm" -rf {} +
+        > "$LOG_FILE"
+        echo -e "${GREEN}Trash emptied permanently.${NC}"
+    else
+        echo -e "${RED}Aborted.${NC}"
+        exit 1
+    fi
+}
+
+# Restore item from trash
+restore_from_trash() {
+    local trash_name="$1"
+    local trash_path="${TRASH_DIR}/${trash_name}"
+
+    if [[ ! -e "$trash_path" ]]; then
+        echo -e "${RED}Error: '${trash_name}' not found in trash.${NC}"
+        exit 1
+    fi
+
+    local original_path=""
+    if [[ -f "$LOG_FILE" ]]; then
+        original_path=$(grep "|${trash_name}$" "$LOG_FILE" | tail -1 | cut -d'|' -f2)
+    fi
+
+    if [[ -z "$original_path" ]]; then
+        echo "Original path unknown. Enter restore destination:"
+        read -r original_path
+    fi
+
+    if [[ -e "$original_path" ]]; then
+        echo -e "${RED}Error: '${original_path}' already exists!${NC}"
+        exit 1
+    fi
+
+    mkdir -p "$(dirname "$original_path")"
+    mv "$trash_path" "$original_path"
+
+    # Remove from log
+    if [[ -f "$LOG_FILE" ]]; then
+        grep -v "|${trash_name}$" "$LOG_FILE" > "${LOG_FILE}.tmp" 2>/dev/null || true
+        mv "${LOG_FILE}.tmp" "$LOG_FILE" 2>/dev/null || true
+    fi
+
+    echo -e "${GREEN}Restored: ${original_path}${NC}"
+}
+
+# Main deletion function
+safe_delete() {
+    local target="$1"
+    local recursive="$2"
+    local force="$3"
+
+    # Resolve to absolute path
+    local abs_path
+    if [[ -e "$target" ]]; then
+        abs_path="$(cd "$(dirname "$target")" && pwd)/$(basename "$target")"
+    else
+        abs_path="$target"
+    fi
+
+    # Remove trailing slash for consistency
+    abs_path="${abs_path%/}"
+
+    # Check if path exists
+    if [[ ! -e "$abs_path" ]]; then
+        if [[ "$force" == "true" ]]; then
+            exit 0
+        else
+            echo -e "${RED}Error: '${abs_path}' does not exist.${NC}"
+            exit 1
+        fi
+    fi
+
+    # Check if directory without -r
+    if [[ -d "$abs_path" ]] && [[ "$recursive" == "false" ]]; then
+        echo -e "${RED}Error: '${abs_path}' is a directory. Use -r to remove.${NC}"
+        exit 1
+    fi
+
+    # Check if path is allowed
+    if ! is_path_allowed "$abs_path"; then
+        exit 1
+    fi
+
+    # Get size
+    local size
+    size=$(du -sh "$abs_path" 2>/dev/null | cut -f1) || size="unknown"
+
+    # Display warning
+    echo ""
+    echo -e "${RED}╔══════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${RED}║                      DELETION CONFIRMATION                       ║${NC}"
+    echo -e "${RED}╚══════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "${YELLOW}Target:${NC} $abs_path"
+    echo -e "${YELLOW}Size:${NC}   $size"
+    echo -e "${YELLOW}Type:${NC}   $([ -d "$abs_path" ] && echo "Directory" || echo "File")"
+    echo ""
+
+    # STEP 1: Type full path
+    echo -e "${CYAN}STEP 1: Type the FULL PATH exactly:${NC}"
+    echo -e "${YELLOW}$abs_path${NC}"
+    echo ""
+    read -r typed_path
+
+    if [[ "$typed_path" != "$abs_path" ]]; then
+        echo -e "${RED}Path mismatch! Aborting.${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}✓ Path confirmed${NC}"
+    echo ""
+
+    # STEP 2: Math problem
+    local num1 num2 expected_sum
+    num1=$(generate_large_number)
+    num2=$(generate_large_number)
+    expected_sum=$((num1 + num2))
+
+    echo -e "${CYAN}STEP 2: Solve this:${NC}"
+    echo -e "${YELLOW}$num1 + $num2 = ?${NC}"
+    echo ""
+    read -r answer
+
+    if [[ "$answer" != "$expected_sum" ]]; then
+        echo -e "${RED}Wrong! Expected: $expected_sum${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}✓ Math verified${NC}"
+    echo ""
+
+    # STEP 3: Final confirmation
+    echo -e "${CYAN}STEP 3: Type 'DELETE' to move to trash:${NC}"
+    read -r final_confirm
+
+    if [[ "$final_confirm" != "DELETE" ]]; then
+        echo -e "${RED}Aborted.${NC}"
+        exit 1
+    fi
+
+    # Move to trash
+    local timestamp trash_name trash_path base_name
+    timestamp=$(date +"%Y%m%d_%H%M%S")
+    base_name=$(basename "$abs_path")
+    trash_name="${timestamp}_${base_name}"
+    trash_path="${TRASH_DIR}/${trash_name}"
+
+    mv "$abs_path" "$trash_path"
+
+    # Log
+    echo "$(date '+%Y-%m-%d %H:%M')|${abs_path}|${trash_name}" >> "$LOG_FILE"
+
+    echo ""
+    echo -e "${GREEN}Moved to trash: ${trash_name}${NC}"
+    echo -e "Kept for ${TRASH_DAYS} days. To restore: ${CYAN}safe-rm --restore '${trash_name}'${NC}"
+    echo -e "To permanently delete: ${CYAN}safe-rm --destroy '${trash_name}'${NC}"
+    echo ""
+
+    # Auto-clean old
+    clean_old_trash 2>/dev/null || true
+}
+
+# Parse arguments
+RECURSIVE=false
+FORCE=false
+TARGETS=()
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            usage
+            ;;
+        -r|-R|--recursive)
+            RECURSIVE=true
+            shift
+            ;;
+        -f|--force)
+            FORCE=true
+            shift
+            ;;
+        -rf|-fr)
+            RECURSIVE=true
+            FORCE=true
+            shift
+            ;;
+        --empty-trash)
+            empty_trash
+            exit 0
+            ;;
+        --list-trash)
+            list_trash
+            exit 0
+            ;;
+        --restore)
+            [[ -z "${2:-}" ]] && { echo -e "${RED}--restore requires argument${NC}"; exit 1; }
+            restore_from_trash "$2"
+            exit 0
+            ;;
+        --destroy)
+            [[ -z "${2:-}" ]] && { echo -e "${RED}--destroy requires argument${NC}"; exit 1; }
+            destroy_from_trash "$2"
+            exit 0
+            ;;
+        --clean-old)
+            clean_old_trash
+            exit 0
+            ;;
+        -*)
+            echo -e "${RED}Unknown option: $1${NC}"
+            usage
+            ;;
+        *)
+            TARGETS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [[ ${#TARGETS[@]} -eq 0 ]]; then
+    echo -e "${RED}No target specified.${NC}"
+    usage
+fi
+
+for target in "${TARGETS[@]}"; do
+    safe_delete "$target" "$RECURSIVE" "$FORCE"
+done

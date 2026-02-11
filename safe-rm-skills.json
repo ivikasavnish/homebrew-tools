@@ -1,17 +1,31 @@
 {
   "name": "safe-rm",
-  "version": "1.0.0",
-  "description": "Safe rm wrapper skills for AI agents",
+  "version": "1.1.0",
+  "description": "Safe rm wrapper with MCP server for AI agents",
+  "homepage": "https://github.com/ivikasavnish/homebrew-tools",
+  "gist": "https://gist.github.com/ivikasavnish/6336e16d11659980e70bd0403131bb54",
+
+  "installation": {
+    "homebrew": "brew install ivikasavnish/tools/safe-rm && safe-rm install",
+    "curl": "curl -fsSL https://gist.githubusercontent.com/ivikasavnish/6336e16d11659980e70bd0403131bb54/raw/safe-rm | bash -s install",
+    "inject_mcp": "safe-rm --inject-all"
+  },
+
   "skills": {
     "list_trash": {
       "command": "rm --list-trash",
+      "mcp_tool": "safe_rm_list_trash",
       "description": "View all items in trash with their IDs and original paths",
       "ai_executable": true,
       "requires_confirmation": false,
-      "example_output": "DATE                 ORIGINAL PATH                                  TRASH ID\n2024-01-15 14:30     ~/Downloads/temp                               20240115_143022_temp"
+      "example": {
+        "input": "rm --list-trash",
+        "output": "DATE                 ORIGINAL PATH                    TRASH ID\n2024-01-15 14:30     ~/Downloads/temp                 20240115_143022_temp"
+      }
     },
     "restore": {
       "command": "rm --restore {trash_id}",
+      "mcp_tool": "safe_rm_restore",
       "description": "Restore a deleted item from trash to its original location",
       "ai_executable": true,
       "requires_confirmation": false,
@@ -19,96 +33,180 @@
         "trash_id": {
           "type": "string",
           "description": "The trash ID from --list-trash output",
+          "pattern": "^[0-9]{8}_[0-9]{6}_[\\w\\-\\.]+$",
           "example": "20240115_143022_temp"
         }
       }
     },
     "status": {
       "command": "rm --status",
+      "mcp_tool": "safe_rm_status",
       "description": "Check safe-rm installation status and configuration",
-      "ai_executable": true,
-      "requires_confirmation": false
-    },
-    "help": {
-      "command": "rm --help",
-      "description": "Show safe-rm help and available options",
       "ai_executable": true,
       "requires_confirmation": false
     },
     "clean_old": {
       "command": "rm --clean-old",
+      "mcp_tool": "safe_rm_clean_old",
       "description": "Remove items older than 7 days from trash",
       "ai_executable": true,
       "requires_confirmation": false
     },
+    "trash_info": {
+      "command": null,
+      "mcp_tool": "safe_rm_trash_info",
+      "description": "Get detailed information about a specific trash item",
+      "ai_executable": true,
+      "requires_confirmation": false,
+      "parameters": {
+        "trash_id": {
+          "type": "string",
+          "description": "The trash ID to get info about"
+        }
+      }
+    },
+    "request_delete": {
+      "command": null,
+      "mcp_tool": "safe_rm_request_delete",
+      "description": "Request file deletion - returns instructions for user to perform manually",
+      "ai_executable": true,
+      "requires_confirmation": false,
+      "parameters": {
+        "path": {
+          "type": "string",
+          "description": "The path to request deletion for"
+        }
+      },
+      "note": "This tool does NOT delete files. It returns instructions for the user."
+    },
     "delete": {
       "command": "rm -rf {path}",
+      "mcp_tool": null,
       "description": "Delete a file or directory (moves to trash)",
       "ai_executable": false,
       "requires_confirmation": true,
       "confirmation_steps": [
-        "Type full absolute path",
-        "Solve 7-digit addition problem",
+        "Type full absolute path exactly",
+        "Solve 7-digit addition problem (e.g., 3847291 + 5192847 = ?)",
         "Type 'DELETE'"
       ],
-      "user_instruction": "Please run 'rm -rf {path}' and complete the confirmation steps"
+      "user_instruction_template": "To delete {path}, please run:\n\n    rm -rf {path}\n\nYou'll need to:\n1. Type the full path to confirm\n2. Solve a math problem\n3. Type 'DELETE'\n\nThe item will be moved to trash for 7 days."
     },
     "destroy": {
       "command": "rm --destroy {trash_id}",
+      "mcp_tool": null,
       "description": "Permanently delete an item from trash",
       "ai_executable": false,
       "requires_confirmation": true,
       "confirmation_steps": ["Type 'DESTROY'"],
-      "user_instruction": "Please run 'rm --destroy {trash_id}' and type DESTROY to confirm"
+      "user_instruction_template": "To permanently delete from trash, please run:\n\n    rm --destroy {trash_id}\n\nYou'll need to type 'DESTROY' to confirm.\n\n⚠️ This cannot be undone."
     },
     "empty_trash": {
       "command": "rm --empty-trash",
+      "mcp_tool": null,
       "description": "Permanently delete all items from trash",
       "ai_executable": false,
       "requires_confirmation": true,
       "confirmation_steps": ["Type 'DESTROY ALL'"],
-      "user_instruction": "Please run 'rm --empty-trash' and type DESTROY ALL to confirm"
+      "user_instruction_template": "To empty all trash, please run:\n\n    rm --empty-trash\n\nYou'll need to type 'DESTROY ALL' to confirm.\n\n⚠️ This cannot be undone."
     }
   },
+
   "blocked_commands": [
     "/bin/rm",
     "/usr/bin/rm",
     "real-rm",
     "command rm",
     "\\rm",
-    "env rm"
+    "env rm",
+    "$(which rm)",
+    "eval rm"
   ],
-  "allowed_paths": [
-    "$HOME/*",
-    "$HOME/Documents/*",
-    "$HOME/Downloads/*"
-  ],
+
+  "allowed_paths": {
+    "patterns": [
+      "$HOME/*",
+      "$HOME/Documents/**",
+      "$HOME/Downloads/**"
+    ],
+    "exceptions": [
+      "$HOME"
+    ]
+  },
+
   "blocked_paths": [
     "/",
     "/bin",
     "/sbin",
     "/usr",
+    "/usr/*",
     "/etc",
+    "/etc/*",
     "/var",
+    "/var/*",
     "/tmp",
     "/opt",
     "/System",
+    "/System/*",
     "/Library",
+    "/Library/*",
     "/Applications",
     "/private",
+    "/private/*",
     "/cores",
-    "/dev",
-    "$HOME"
+    "/dev"
   ],
-  "agent_instructions": {
-    "on_delete_request": "Inform user to run 'rm -rf <path>' manually and complete confirmation steps",
-    "on_recovery_request": "Use 'rm --list-trash' to find items, then 'rm --restore <id>' to recover",
-    "on_permanent_delete_request": "Inform user to run the command manually with confirmation",
-    "never_do": [
-      "Bypass safe-rm using /bin/rm or real-rm",
-      "Pipe input to rm commands",
+
+  "agent_behavior": {
+    "on_delete_request": {
+      "action": "inform_user",
+      "message_template": "To delete {path}, please run `rm -rf {path}` and complete the confirmation steps (path typing, math puzzle, DELETE)."
+    },
+    "on_recovery_request": {
+      "action": "execute",
+      "steps": [
+        "Run `rm --list-trash` to find items",
+        "Run `rm --restore <id>` to recover"
+      ]
+    },
+    "on_permanent_delete_request": {
+      "action": "inform_user",
+      "message_template": "To permanently delete, please run the command manually with confirmation."
+    }
+  },
+
+  "rules": {
+    "must_do": [
+      "Use rm --list-trash to view deleted items",
+      "Use rm --restore <id> to recover files",
+      "Inform users to run deletion commands manually",
+      "Explain the 3-step confirmation process"
+    ],
+    "must_not": [
+      "Use /bin/rm, real-rm, or any bypass method",
       "Attempt to automate confirmation steps",
-      "Use echo or expect to simulate user input"
+      "Pipe input to rm commands",
+      "Use echo or expect to simulate user input",
+      "Execute rm -rf directly"
     ]
-  }
+  },
+
+  "mcp_server": {
+    "command": "python3",
+    "args": ["$HOME/bin/safe-rm-mcp-server.py"],
+    "env": {
+      "SAFE_RM_PATH": "$HOME/bin/safe-rm"
+    },
+    "protocol": "stdio",
+    "tools": [
+      "safe_rm_list_trash",
+      "safe_rm_restore",
+      "safe_rm_status",
+      "safe_rm_clean_old",
+      "safe_rm_trash_info",
+      "safe_rm_request_delete"
+    ]
+  },
+
+  "claude_md_snippet": "## File Deletion Policy (safe-rm)\n\nThis system uses safe-rm for file deletion safety.\n\n### Safe Commands (AI can execute)\n- `rm --list-trash` - View deleted items\n- `rm --restore <id>` - Restore from trash\n- `rm --status` - Check installation\n- `rm --clean-old` - Clean old trash items\n\n### User-Only Commands (require confirmation)\n- `rm -rf <path>` - Requires: path + math + DELETE\n- `rm --destroy <id>` - Requires: DESTROY\n- `rm --empty-trash` - Requires: DESTROY ALL\n\n### NEVER Use (blocked)\n- `/bin/rm` - Bypasses safety\n- `real-rm` - Bypasses safety"
 }

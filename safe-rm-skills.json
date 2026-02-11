@@ -1,0 +1,114 @@
+{
+  "name": "safe-rm",
+  "version": "1.0.0",
+  "description": "Safe rm wrapper skills for AI agents",
+  "skills": {
+    "list_trash": {
+      "command": "rm --list-trash",
+      "description": "View all items in trash with their IDs and original paths",
+      "ai_executable": true,
+      "requires_confirmation": false,
+      "example_output": "DATE                 ORIGINAL PATH                                  TRASH ID\n2024-01-15 14:30     ~/Downloads/temp                               20240115_143022_temp"
+    },
+    "restore": {
+      "command": "rm --restore {trash_id}",
+      "description": "Restore a deleted item from trash to its original location",
+      "ai_executable": true,
+      "requires_confirmation": false,
+      "parameters": {
+        "trash_id": {
+          "type": "string",
+          "description": "The trash ID from --list-trash output",
+          "example": "20240115_143022_temp"
+        }
+      }
+    },
+    "status": {
+      "command": "rm --status",
+      "description": "Check safe-rm installation status and configuration",
+      "ai_executable": true,
+      "requires_confirmation": false
+    },
+    "help": {
+      "command": "rm --help",
+      "description": "Show safe-rm help and available options",
+      "ai_executable": true,
+      "requires_confirmation": false
+    },
+    "clean_old": {
+      "command": "rm --clean-old",
+      "description": "Remove items older than 7 days from trash",
+      "ai_executable": true,
+      "requires_confirmation": false
+    },
+    "delete": {
+      "command": "rm -rf {path}",
+      "description": "Delete a file or directory (moves to trash)",
+      "ai_executable": false,
+      "requires_confirmation": true,
+      "confirmation_steps": [
+        "Type full absolute path",
+        "Solve 7-digit addition problem",
+        "Type 'DELETE'"
+      ],
+      "user_instruction": "Please run 'rm -rf {path}' and complete the confirmation steps"
+    },
+    "destroy": {
+      "command": "rm --destroy {trash_id}",
+      "description": "Permanently delete an item from trash",
+      "ai_executable": false,
+      "requires_confirmation": true,
+      "confirmation_steps": ["Type 'DESTROY'"],
+      "user_instruction": "Please run 'rm --destroy {trash_id}' and type DESTROY to confirm"
+    },
+    "empty_trash": {
+      "command": "rm --empty-trash",
+      "description": "Permanently delete all items from trash",
+      "ai_executable": false,
+      "requires_confirmation": true,
+      "confirmation_steps": ["Type 'DESTROY ALL'"],
+      "user_instruction": "Please run 'rm --empty-trash' and type DESTROY ALL to confirm"
+    }
+  },
+  "blocked_commands": [
+    "/bin/rm",
+    "/usr/bin/rm",
+    "real-rm",
+    "command rm",
+    "\\rm",
+    "env rm"
+  ],
+  "allowed_paths": [
+    "$HOME/*",
+    "$HOME/Documents/*",
+    "$HOME/Downloads/*"
+  ],
+  "blocked_paths": [
+    "/",
+    "/bin",
+    "/sbin",
+    "/usr",
+    "/etc",
+    "/var",
+    "/tmp",
+    "/opt",
+    "/System",
+    "/Library",
+    "/Applications",
+    "/private",
+    "/cores",
+    "/dev",
+    "$HOME"
+  ],
+  "agent_instructions": {
+    "on_delete_request": "Inform user to run 'rm -rf <path>' manually and complete confirmation steps",
+    "on_recovery_request": "Use 'rm --list-trash' to find items, then 'rm --restore <id>' to recover",
+    "on_permanent_delete_request": "Inform user to run the command manually with confirmation",
+    "never_do": [
+      "Bypass safe-rm using /bin/rm or real-rm",
+      "Pipe input to rm commands",
+      "Attempt to automate confirmation steps",
+      "Use echo or expect to simulate user input"
+    ]
+  }
+}

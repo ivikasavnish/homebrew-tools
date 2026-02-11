@@ -1,38 +1,28 @@
 class SafeRm < Formula
   desc "Safe rm wrapper with MCP server for AI agents - requires confirmation, math puzzle, uses trash"
-  homepage "https://gist.github.com/ivikasavnish/6336e16d11659980e70bd0403131bb54"
-  url "https://gist.githubusercontent.com/ivikasavnish/6336e16d11659980e70bd0403131bb54/raw/safe-rm"
-  version "1.1.0"
-  sha256 "f2695354766dbebfa82fb34c8c8390fe063bffb796198255c718022abc91c84a"
+  homepage "https://github.com/ivikasavnish/homebrew-tools"
+  url "https://raw.githubusercontent.com/ivikasavnish/homebrew-tools/main/safe-rm"
+  version "1.1.1"
   license "MIT"
 
+  sha256 "f2695354766dbebfa82fb34c8c8390fe063bffb796198255c718022abc91c84a"
+
   depends_on "python@3"
-
-  resource "mcp_server" do
-    url "https://gist.githubusercontent.com/ivikasavnish/6336e16d11659980e70bd0403131bb54/raw/safe-rm-mcp-server.py"
-    sha256 :no_check  # Raw gist URLs don't have stable hashes
-  end
-
-  resource "agent_skills" do
-    url "https://gist.githubusercontent.com/ivikasavnish/6336e16d11659980e70bd0403131bb54/raw/safe-rm-skills.json"
-    sha256 :no_check
-  end
 
   def install
     bin.install "safe-rm"
 
-    resource("mcp_server").stage do
-      bin.install "safe-rm-mcp-server.py"
-    end
+    # Install MCP server from repo
+    mcp_server_url = "https://raw.githubusercontent.com/ivikasavnish/homebrew-tools/main/safe-rm-mcp-server.py"
+    mcp_server_path = bin/"safe-rm-mcp-server.py"
 
-    resource("agent_skills").stage do
-      (share/"safe-rm").install "safe-rm-skills.json"
-    end
-  end
+    system "curl", "-fsSL", mcp_server_url, "-o", mcp_server_path
+    chmod 0755, mcp_server_path
 
-  def post_install
-    # Create symlink for MCP server
-    ln_sf bin/"safe-rm-mcp-server.py", bin/"safe-rm-mcp"
+    # Install skills JSON
+    skills_url = "https://raw.githubusercontent.com/ivikasavnish/homebrew-tools/main/safe-rm-skills.json"
+    (share/"safe-rm").mkpath
+    system "curl", "-fsSL", skills_url, "-o", share/"safe-rm/safe-rm-skills.json"
   end
 
   def caveats
@@ -66,6 +56,5 @@ class SafeRm < Formula
 
   test do
     assert_match "safe rm wrapper", shell_output("#{bin}/safe-rm --help")
-    assert_predicate bin/"safe-rm-mcp-server.py", :exist?
   end
 end
